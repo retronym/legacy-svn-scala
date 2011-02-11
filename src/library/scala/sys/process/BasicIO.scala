@@ -49,15 +49,15 @@ object BasicIO {
     new ProcessIO(input(withIn), processFully(buffer), getErr(log))
 
   def apply(withIn: Boolean, log: ProcessLogger) =
-    new ProcessIO(input(withIn), processInfoFully(log), processErrFully(log))
+    new ProcessIO(input(withIn), processOutFully(log), processErrFully(log))
 
   def getErr(log: Option[ProcessLogger]) = log match {
     case Some(lg) => processErrFully(lg)
     case None     => toStdErr
   }
 
-  private def processErrFully(log: ProcessLogger)  = processFully(log error _)
-  private def processInfoFully(log: ProcessLogger) = processFully(log info _)
+  private def processErrFully(log: ProcessLogger)  = processFully(log err _)
+  private def processOutFully(log: ProcessLogger) = processFully(log out _)
 
   def ignoreOut = (i: OutputStream) => ()
 
