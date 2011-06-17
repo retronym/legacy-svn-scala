@@ -11,6 +11,7 @@ import scala.collection.mutable.ListBuffer
 import scala.util.control.ControlThrowable
 import scala.tools.util.StringOps.{ countAsString, countElementsAsString }
 import symtab.Flags._
+import scala.annotation.tailrec
 
 /** This trait ...
  *
@@ -308,6 +309,7 @@ trait Infer {
      *  they are: perhaps someone more familiar with the intentional distinctions
      *  can examine the now much smaller concrete implementations below.
      */
+/*
     abstract class CompatibilityChecker {
       def resultTypeCheck(restpe: Type, arg: Type): Boolean
       def argumentCheck(arg: Type, param: Type): Boolean
@@ -317,7 +319,7 @@ trait Infer {
         val MethodType(params, restpe) = tp
         val TypeRef(pre, sym, args) = pt
 
-        if (sym.isAliasType) apply(tp, pt.dealias)
+        if (sym.isAliasType) apply(tp, pt.normalize)
         else if (sym.isAbstractType) apply(tp, pt.bounds.lo)
         else {
           val len = args.length - 1
@@ -353,7 +355,7 @@ trait Infer {
     }
     
     object isPlausiblyCompatible extends CompatibilityChecker {
-      def resultTypeCheck(restpe: Type, arg: Type) = isPlausiblySubType(restpe, arg)
+      def resultTypeCheck(restpe: Type, arg: Type) = isPlausiblyCompatible(restpe, arg)
       def argumentCheck(arg: Type, param: Type)    = isPlausiblySubType(arg, param)
       def lastChanceCheck(tp: Type, pt: Type)      = false
     }
@@ -367,22 +369,75 @@ trait Infer {
         case _                         => super.apply(tp, pt)
       }
     }
+*/
+    def isPlausiblyCompatible(tp: Type, pt: Type) = checkCompatibility(true, tp, pt)
+    def normSubType(tp: Type, pt: Type) = checkCompatibility(false, tp, pt)
+
+    @tailrec private def checkCompatibility(fast: Boolean, tp: Type, pt: Type): Boolean = tp match {
+      case mt @ MethodType(params, restpe) =>
+        if (mt.isImplicit)
+          checkCompatibility(fast, restpe, pt)
+        else pt match {
+          case tr @ TypeRef(pre, sym, args) => 
+
+            if (sym.isAliasType) checkCompatibility(fast, tp, pt.normalize)
+            else if (sym.isAbstractType) checkCompatibility(fast, tp, pt.bounds.lo)
+            else {
+              val len = args.length - 1
+              hasLength(params, len) &&
+              sym == FunctionClass(len) && {
+                var ps = params
+                var as = args
+                if (fast) {
+                  while (ps.nonEmpty && as.nonEmpty) {
+                    if (!isPlausiblySubType(as.head, ps.head.tpe))
+                      return false
+                    ps = ps.tail
+                    as = as.tail
+                  }
+                } else {
+                  while (ps.nonEmpty && as.nonEmpty) {
+                    if (!(as.head <:< ps.head.tpe))
+                      return false
+                    ps = ps.tail
+                    as = as.tail
+                  }
+                }
+                ps.isEmpty && as.nonEmpty && {
+                  val lastArg = as.head
+                  as.tail.isEmpty && checkCompatibility(fast, restpe, lastArg)
+                }
+              }
+            }
+          
+          case _            => if (fast) false else tp <:< pt
+        }
+      case NullaryMethodType(restpe)  => checkCompatibility(fast, restpe, pt)
+      case PolyType(_, restpe)        => checkCompatibility(fast, restpe, pt)
+      case ExistentialType(_, qtpe)   => if (fast) checkCompatibility(fast, qtpe, pt) else normalize(tp) <:< pt // is !fast case needed??
+      case _                          => if (fast) isPlausiblySubType(tp, pt) else tp <:< pt
+    }
+
 
     /** This expresses more cleanly in the negative: there's a linear path
      *  to a final true or false.
      */
     private def isPlausiblySubType(tp1: Type, tp2: Type) = !isImpossibleSubType(tp1, tp2)
-    private def isImpossibleSubType(tp1: Type, tp2: Type) = {
-      (tp1.dealias, tp2.dealias) match {
-        case (TypeRef(_, sym1, _), TypeRef(_, sym2, _)) =>
-           sym1.isClass &&
-           sym2.isClass &&
-          !(sym1 isSubClass sym2) &&
-          !(sym1 isNumericSubClass sym2)
-        case _ =>
-          false
-      }
-    }
+    private def isImpossibleSubType(tp1: Type, tp2: Type) = tp1.normalize.widen match {
+      case tr1 @ TypeRef(_, sym1, _) =>
+        tp2.normalize.widen match {
+          case TypeRef(_, sym2, _) =>
+             sym1.isClass &&
+             sym2.isClass &&
+            !(sym1 isSubClass sym2) &&
+            !(sym1 isNumericSubClass sym2)
+          // XXX - disabled for preventing scalaz from building.
+          // case RefinedType(_, decls) =>
+          //   decls.nonEmpty && tp1.member(decls.head.name) == NoSymbol
+          case _ => false
+        }
+      case _ => false
+    }      
 
     def isCompatible(tp: Type, pt: Type): Boolean = {
       val tp1 = normalize(tp)
@@ -444,12 +499,13 @@ trait Infer {
      *  @param pt      ...
      *  @return        ...
      */
-    private def exprTypeArgs(tparams: List[Symbol], restpe: Type, pt: Type, checkCompat: (Type, Type) => Boolean = isCompatible): List[Type] = {
+    private def exprTypeArgs(tparams: List[Symbol], restpe: Type, pt: Type, useWeaklyCompatible: Boolean = false): List[Type] = {
       val tvars = tparams map freshVar
-      if (checkCompat(restpe.instantiateTypeParams(tparams, tvars), pt)) {
+      val instResTp = restpe.instantiateTypeParams(tparams, tvars)
+      if ( if (useWeaklyCompatible) isWeaklyCompatible(instResTp, pt) else isCompatible(instResTp, pt) ) {
         try {
           // If the restpe is an implicit method, and the expected type is fully defined
-          // optimze type variables wrt to the implicit formals only; ignore the result type.
+          // optimize type variables wrt to the implicit formals only; ignore the result type.
           // See test pos/jesper.scala 
           val varianceType = restpe match { 
             case mt: MethodType if mt.isImplicit && isFullyDefined(pt) =>
@@ -780,7 +836,7 @@ trait Infer {
               try {
                 val AdjustedTypeArgs.Undets(okparams, okargs, leftUndet) = methTypeArgs(undetparams, formals, restpe, argtpes, pt)
                 // #2665: must use weak conformance, not regular one (follow the monomorphic case above)
-                (exprTypeArgs(leftUndet, restpe.instantiateTypeParams(okparams, okargs), pt, isWeaklyCompatible) ne null) && 
+                (exprTypeArgs(leftUndet, restpe.instantiateTypeParams(okparams, okargs), pt, useWeaklyCompatible = true) ne null) && 
                 isWithinBounds(NoPrefix, NoSymbol, okparams, okargs)
               } catch {
                 case ex: NoInstance => false
@@ -1105,7 +1161,7 @@ trait Infer {
      * Substitute `tparams` to `targs` in `tree`, after adjustment by `adjustTypeArgs`, returning the type parameters that were not determined
      * If passed, infers against specified type `treeTp` instead of `tree.tp`.
      */
-    def inferExprInstance(tree: Tree, tparams: List[Symbol], pt: Type = WildcardType, treeTp0: Type = null, keepNothings: Boolean = true, checkCompat: (Type, Type) => Boolean = isCompatible): List[Symbol] = {
+    def inferExprInstance(tree: Tree, tparams: List[Symbol], pt: Type = WildcardType, treeTp0: Type = null, keepNothings: Boolean = true, useWeaklyCompatible: Boolean = false): List[Symbol] = {
       val treeTp = if(treeTp0 eq null) tree.tpe else treeTp0 // can't refer to tree in default for treeTp0
       printInference(
         ptBlock("inferExprInstance",
@@ -1115,7 +1171,7 @@ trait Infer {
           "pt"      -> pt
         )
       )
-      val targs = exprTypeArgs(tparams, treeTp, pt, checkCompat)
+      val targs = exprTypeArgs(tparams, treeTp, pt, useWeaklyCompatible)
 
       if (keepNothings || (targs eq null)) { //@M: adjustTypeArgs fails if targs==null, neg/t0226
         substExpr(tree, tparams, targs, pt)
@@ -1353,13 +1409,14 @@ trait Infer {
             } else {
               for (arg <- args) {
                 if (sym == ArrayClass) check(arg, bound)
+                else if (arg.typeArgs.nonEmpty) ()   // avoid spurious warnings with higher-kinded types
                 else arg match {
                   case TypeRef(_, sym, _) if isLocalBinding(sym) =>
                     ;
                   case _ =>
                     patternWarning(arg, "non variable type-argument ")
                 }
-              }
+              } 
             }
             check(pre, bound)
           case RefinedType(parents, decls) =>

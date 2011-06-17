@@ -404,7 +404,9 @@ trait Symbols /* extends reflect.generic.Symbols*/ { self: SymbolTable =>
         var is = infos
         (is eq null) || {
           while (is.prev ne null) { is = is.prev }
-          is.info.isComplete && is.info.typeParams.isEmpty
+          is.info.isComplete && !is.info.isHigherKinded // was: is.info.typeParams.isEmpty. 
+          // YourKit listed the call to PolyType.typeParams as a hot spot but it is likely an artefact. 
+          // The change to isHigherKinded did not reduce the total running time.
         }
       }
 
@@ -505,14 +507,7 @@ trait Symbols /* extends reflect.generic.Symbols*/ { self: SymbolTable =>
     final def isLocal: Boolean = owner.isTerm
 
     /** Is this symbol a constant? */
-    final def isConstant: Boolean =
-      isStable && (tpe match {
-        case ConstantType(_) => true
-        case PolyType(_, ConstantType(_)) => true
-        case MethodType(_, ConstantType(_)) => true
-        case NullaryMethodType(ConstantType(_)) => true
-        case _ => false
-      })
+    final def isConstant: Boolean = isStable && isConstantType(tpe.resultType)
 
     /** Is this class nested in another class or module (not a package)? */
     final def isNestedClass: Boolean =
@@ -693,6 +688,21 @@ trait Symbols /* extends reflect.generic.Symbols*/ { self: SymbolTable =>
     
     /** Does symbol have ALL the flags in `mask` set? */
     final def hasAllFlags(mask: Long): Boolean = (flags & mask) == mask
+    
+    /** If the given flag is set on this symbol, also set the corresponding
+     *  notFLAG.  For instance if flag is PRIVATE, the notPRIVATE flag will
+     *  be set if PRIVATE is currently set.
+     */
+    final def setNotFlag(flag: Int) = if (hasFlag(flag)) setFlag((flag: @annotation.switch) match {
+      case FINAL     => notFINAL
+      case PRIVATE   => notPRIVATE
+      case DEFERRED  => notDEFERRED
+      case PROTECTED => notPROTECTED
+      case ABSTRACT  => notABSTRACT
+      case OVERRIDE  => notOVERRIDE
+      case METHOD    => notMETHOD
+      case _         => abort("setNotFlag on invalid flag: " + flag)
+    })
 
     /** The class or term up to which this symbol is accessible,
      *  or RootClass if it is public.  As java protected statics are
@@ -1116,13 +1126,13 @@ trait Symbols /* extends reflect.generic.Symbols*/ { self: SymbolTable =>
       this == that || this.isError || that.isError ||
       info.baseTypeIndex(that) >= 0
 
-    final def isSubClass(that: Symbol): Boolean = {
+    final def isSubClass(that: Symbol): Boolean = (
       isNonBottomSubClass(that) ||
       this == NothingClass ||
       this == NullClass &&
       (that == AnyClass ||
-       that != NothingClass && (that isSubClass AnyRefClass))
-    }
+       that != NothingClass && (that isSubClass ObjectClass))
+    )
     final def isNumericSubClass(that: Symbol): Boolean =
       definitions.isNumericSubClass(this, that)
 
